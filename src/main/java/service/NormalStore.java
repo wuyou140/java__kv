@@ -28,64 +28,57 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public class NormalStore implements Store {
-
     public static final String TABLE = ".table";
     public static final String RW_MODE = "rw";
     public static final String NAME = "data";
+    //持久化阈值
+    private static final int MAX_COMMAND_LENGTH = 1024;
+    private static long maxsizeKB = 50;
+    private final int storeThreshold = 50;
+    private final String walFilePath;
+
     private final Logger LOGGER = LoggerFactory.getLogger(NormalStore.class);
     private final String logFormat = "[NormalStore][{}]: {}";
-
-
-    /**
-     * 内存表，类似缓存
-     */
-    private TreeMap<String, Command> memTable;
-
-    /**
-     * hash索引，存的是数据长度和偏移量
-     * */
-    private HashMap<String, CommandPos> index;
-
-    /**
-     * 数据目录
-     */
+    //数据目录
     private final String dataDir;
+    //读写锁
+    private final ReadWriteLock indexLock = new ReentrantReadWriteLock();
+    //内存表
+    private final TreeMap<String, Command> memTable = new TreeMap<>();
+    //hash索引，存的是数据长度和偏移量
+    private final HashMap<String, CommandPos> index = new HashMap<>();
+    //线程池
+    private ExecutorService deduplicationExecutor = Executors.newFixedThreadPool(5);
+    private String currentFilePath;
 
-    /**
-     * 读写锁，支持多线程，并发安全写入
-     */
-    private final ReadWriteLock indexLock;
+
+    // 构造方法，初始化
+    public NormalStore(String dataDir) {
+        this.dataDir = dataDir;
+        File file = new File(dataDir);
+        if (!file.exists()) {
+            LoggerUtil.info(LOGGER, logFormat, "NormalStore", "dataDir isn't exist, creating...");
+            file.mkdirs();
+        }
+        this.walFilePath = this.genWalFilePath();
+        this.reloadIndexes();
+        this.replayWal();
+        this.currentFilePath = this.genFilePath();
+    }
+
+    // 生成持久化文件的路径
+    private String genFilePath() {
+        return this.dataDir + File.separator + NAME + TABLE;
+    }
+
 
     /**
      * 暂存数据的日志句柄
      */
     private RandomAccessFile writerReader;
 
-    /**
-     * 持久化阈值
-     */
-    private final int storeThreshold = 50;
-    private String walFilePath;
 
-    //构造方法，初始化
-    public NormalStore(String dataDir) {
-        this.dataDir = dataDir;
-        this.indexLock = new ReentrantReadWriteLock();
-        this.memTable = new TreeMap<String, Command>();
-        this.index = new HashMap<>();
 
-        File file = new File(dataDir);
-        if (!file.exists()) {
-            LoggerUtil.info(LOGGER,logFormat, "NormalStore","dataDir isn't exist,creating...");
-            file.mkdirs();
-        }
-        this.reloadIndexes();
-    }
-
-    // 生成持久化文件的路径
-    public String genFilePath() {
-        return this.dataDir + File.separator + NAME + TABLE;
-    }
 
     // 重新加载索引数据
     public void reloadIndexes() {
@@ -133,7 +126,8 @@ public class NormalStore implements Store {
     reloadIndex("data.table");
     LoggerUtil.debug(LOGGER, logFormat, "reload index: " + index.toString());
 }
-private static final int MAX_COMMAND_LENGTH = 1024;
+
+//重新加载索引
     public void reloadIndex(String fileName) {
         //定义字节数组用来读取文件中的数据
         byte[] bytes = new byte[MAX_COMMAND_LENGTH];
@@ -180,7 +174,11 @@ private static final int MAX_COMMAND_LENGTH = 1024;
 
             // 检查内存表是否达到阈值
             if (memTable.size() >= storeThreshold) {
-                persistMemTable(); // 持久化内存表
+                try {
+                    persistMemTable();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         } catch (Throwable t) {
             throw new RuntimeException(t);
@@ -189,20 +187,7 @@ private static final int MAX_COMMAND_LENGTH = 1024;
         }
     }
 
-    private void persistMemTable() throws IOException {
-        // 将内存表中的数据写入磁盘
-        for (Map.Entry<String, Command> entry : memTable.entrySet()) {
-            byte[] commandBytes = JSONObject.toJSONBytes(entry.getValue());
-            // 写table（wal）文件
-            rotate();
-            RandomAccessFileUtil.writeInt(this.genFilePath(), commandBytes.length);
-            int pos = RandomAccessFileUtil.write(this.genFilePath(), commandBytes);
-            // 更新索引
-            CommandPos cmdPos = new CommandPos(pos, commandBytes.length, this.genFilePath());
-            index.put(entry.getKey(), cmdPos);
-        }
-        memTable.clear(); // 清空内存表
-    }
+
 
     @Override
     public String get(String key) {
@@ -237,6 +222,8 @@ private static final int MAX_COMMAND_LENGTH = 1024;
         }
         return null;
     }
+
+
     @Override
     public void rm(String key) {
         try {
@@ -260,88 +247,145 @@ private static final int MAX_COMMAND_LENGTH = 1024;
             indexLock.writeLock().unlock();
         }
     }
+
     // 回放WAL文件
     private void replayWal() {
         try (RandomAccessFile walFile = new RandomAccessFile(walFilePath, "r")) {
             long len = walFile.length();
             long start = 0;
             byte[] bytes = new byte[1024];
+
             while (start < len) {
+                // 确保文件中有足够的数据来读取 int 类型的 cmdLen
+                /*if (len - start < 4) {
+                    throw new IOException("File truncated or corrupted: not enough data for cmdLen.");
+                }*/
+
                 int cmdLen = walFile.readInt();
+                // 调整 buffer 大小以适应 cmdLen
                 if (cmdLen > bytes.length) {
                     bytes = new byte[cmdLen];
                 }
+
+                // 确保文件中有足够的数据来读取 cmdLen 长度的数据
+                /*if (len - start < 4 + cmdLen) {
+                    throw new IOException("File truncated or corrupted: not enough data for command.");
+                }*/
+
                 walFile.readFully(bytes, 0, cmdLen);
                 JSONObject value = JSONObject.parseObject(new String(bytes, 0, cmdLen, StandardCharsets.UTF_8));
                 Command command = CommandUtil.jsonToCommand(value);
-                if (command instanceof SetCommand) {
-                    memTable.put(command.getKey(), command);
-                } else if (command instanceof RmCommand) {
+                if (command instanceof SetCommand || command instanceof RmCommand) {
                     memTable.put(command.getKey(), command);
                 }
-                start += 4 + cmdLen;
+
+                start += 4 + cmdLen; // 4 bytes for int cmdLen
             }
+        } catch (EOFException e) {
+            System.err.println("EOFException encountered: " + e.getMessage());
         } catch (IOException e) {
-            e.printStackTrace();
+            System.err.println("IOException encountered: " + e.getMessage());
         }
     }
     private String genWalFilePath() {
-        return this.walFilePath;
+        return "D:/ideaproject/nosqldatebase/logs/nosql.log";
     }
-    @Override
-    public void close() throws IOException {
 
-    }
-    /*文件达到一定大小时：
-    关闭当前文件，并检查其大小是否超过设定的最大限制。
-    如果超出限制，则重命名当前文件，并将其压缩为 .zip 文件。
-    清空索引，以便在新的文件中重新开始记录数据。*/
-    private static long maxsizeKB = 50;
-    public void rotate() throws IOException {
-        RandomAccessFile file1 = new RandomAccessFile(this.genFilePath(), RW_MODE);
-        long len = file1.length();
-        file1.close();
-        if (maxsizeKB<=len){
-            File file = new File(this.genFilePath());
+
+
+    public synchronized void rotate() throws IOException {
+        RandomAccessFile currentFile = new RandomAccessFile(this.currentFilePath, "rw");
+        long len = currentFile.length();
+        currentFile.close();
+
+        if (len >= maxsizeKB * 1024) {
+            // 创建新文件名，例如：data_yyyyMMdd_HHmmss.table
             SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd_HHmmss");
             String formattedDateTime = dateFormat.format(new Date());
-            String newfilepath = this.dataDir + File.separator + formattedDateTime + TABLE;
-            String zipfilepath = this.dataDir + File.separator + formattedDateTime + ".zip";
-            File newfile = new File(newfilepath);
-            boolean b = file.renameTo(newfile);
-            zip(newfilepath,zipfilepath);
-            index.clear();
+            String newFileName = this.dataDir + File.separator + NAME + "_" + formattedDateTime + TABLE;
+
+            // 重命名当前文件
+            File currentFileObject = new File(this.currentFilePath);
+            File newFileObject = new File(newFileName);
+            boolean renamed = currentFileObject.renameTo(newFileObject);
+
+            if (renamed) {
+                // 更新当前文件路径为新文件路径
+                this.currentFilePath = newFileName;
+                // 清空索引，准备在新文件中记录数据
+                this.index.clear();
+                // 可以添加日志记录操作
+                LoggerUtil.info(LOGGER, logFormat, "rotate", "Rotated to new file: " + newFileName);
+            } else {
+                // 处理重命名失败的情况
+                LoggerUtil.error(LOGGER, null, "Failed to rotate file");
+            }
         }
     }
 
-    //多线程压缩
-    //创建了一个固定大小为5的线程池，用于异步执行文件压缩任务
-    private ExecutorService executor = Executors.newFixedThreadPool(5);
-    public void zip(String sourceFile,String zipfile) {
-        executor.submit(() ->{
-            byte[] buffer = new byte[1024];
-            try (FileOutputStream fos = new FileOutputStream(zipfile);
-                 ZipOutputStream zos = new ZipOutputStream(fos);
-                 FileInputStream fis = new FileInputStream(sourceFile)) {
+    private void persistMemTable() throws IOException {
+        // 从内存表中获取所有命令并添加到列表中
+        List<Command> commands = new ArrayList<>(memTable.values());
 
-                // 将文件添加到压缩流中
-                ZipEntry ze = new ZipEntry(sourceFile);
-                zos.putNextEntry(ze);
+        // 如果内存表中的命令数量大于0，则继续处理
+        if (!commands.isEmpty()) {
+            // 调用 rotate 方法检查是否需要滚动 WAL 文件
+            rotate();
 
-                int length;
-                while ((length = fis.read(buffer)) > 0) {
-                    zos.write(buffer, 0, length);
+            // 为去重操作创建一个线程池，如果已有线程池则使用现有线程池
+            ExecutorService deduplicationExecutor = Executors.newFixedThreadPool(5);
+
+            try {
+                // 提交去重任务到线程池
+                for (Command command : commands) {
+                    deduplicationExecutor.submit(() -> {
+                        try {
+                            deduplicateAndWriteToDisk(command);
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    });
                 }
-
-                zos.closeEntry();
-            } catch (IOException e) {
-                e.printStackTrace();
+            } finally {
+                // 关闭线程池
+                deduplicationExecutor.shutdown();
             }
-        });
+        }
+
+        // 清空内存表
+        memTable.clear();
     }
 
+    // 执行单个命令的数据去重和写入磁盘
+    private void deduplicateAndWriteToDisk(Command command) throws IOException {
+        // 检查索引，确定是否已存在相同的 key
+        if (!index.containsKey(command.getKey())) {
+            // 写入新数据到磁盘
+            try (RandomAccessFile file = new RandomAccessFile(this.genFilePath(), "rw")) {
+                byte[] commandBytes = JSONObject.toJSONBytes(command);
+                file.writeInt(commandBytes.length);
+                file.write(commandBytes);
+
+                // 更新索引
+                CommandPos cmdPos = new CommandPos((int) file.getFilePointer(), commandBytes.length, this.genFilePath());
+                index.put(command.getKey(), cmdPos);
+            }
+        }
+    }
+
+    // 检查磁盘上是否已存在相同的key
+    private boolean isKeyExistsOnDisk(String key) {
+        // 检查索引，如果索引中存在key，则认为已存在
+        return index.containsKey(key);
+    }
+
+
     //关闭线程池
-    public void exe_shutdown(){
-        executor.shutdown();
+    @Override
+    public void close() throws IOException {
+        // 关闭去重线程池
+        if (!deduplicationExecutor.isShutdown()) {
+            deduplicationExecutor.shutdown();
+        }
     }
 }
